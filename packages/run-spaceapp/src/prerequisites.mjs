@@ -654,7 +654,7 @@ async function dockerCliAndComposeAreAvailable(execute) {
   return true;
 }
 
-async function dockerIsReady(execute) {
+export async function dockerIsReady(execute) {
   for (const spec of [
     { command: "docker", args: ["--version"] },
     { command: "docker", args: ["compose", "version"] },
@@ -665,6 +665,40 @@ async function dockerIsReady(execute) {
     }
   }
   return true;
+}
+
+export async function podmanIsReady(execute) {
+  for (const spec of [
+    { command: "podman", args: ["--version"] },
+    { command: "podman", args: ["compose", "version"] },
+    { command: "podman", args: ["info"] }
+  ]) {
+    if (await execute(spec, { stdout: null, stderr: null }) !== 0) {
+      return false;
+    }
+  }
+  return true;
+}
+
+export async function ensurePodmanAvailable({
+  platform = process.platform,
+  stdout = process.stdout,
+  stderr = process.stderr,
+  execute
+}) {
+  if (platform === "win32") {
+    stderr.write("Podman engine support is available on Linux and macOS only.\n");
+    return { code: 1, reexecuted: false };
+  }
+  if (await podmanIsReady(execute)) {
+    return { code: 0, reexecuted: false };
+  }
+  stderr.write(
+    platform === "darwin"
+      ? "Podman and `podman compose` (Podman >= 5 with docker-compose v2 provider) must be installed and your Podman machine must be running (`podman machine init --cpus 4 --memory 8192 --disk-size 25 && podman machine start`).\n"
+      : "Rootless Podman (>= 5) and `podman compose` (with docker-compose v2 provider) must be installed and ready (for example `sudo dnf install -y podman podman-compose docker-compose` on Fedora/RHEL or `sudo apt-get install -y podman podman-compose docker-compose-v2` on Ubuntu/Debian).\n"
+  );
+  return { code: 1, reexecuted: false };
 }
 
 async function installLinuxDockerEngine({

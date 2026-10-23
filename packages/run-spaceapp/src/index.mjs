@@ -129,8 +129,10 @@ const CONFIG_KEYS = new Set([
   "companionsEnabled",
   "optionalModules",
   "installId",
-  "users"
+  "users",
+  "engine"
 ]);
+export const SUPPORTED_ENGINES = Object.freeze(["docker", "podman"]);
 
 // Multi-user (SpaceApp accounts with SPACE_MULTI_USER_ENABLED): every user's CLIs run in their own container, with
 // their own keys, logins, memory and workspaces; the core starts each pane in its owner's container.
@@ -182,6 +184,16 @@ export function resolveInstallProfile(requestedProfile, resources) {
     if (installResourceChecks(resources, profile).every((check) => check.ok)) return profile;
   }
   return "small";
+}
+
+export function resolveInstallEngine(requestedEngine, existingEngine = "docker") {
+  if (requestedEngine === undefined) {
+    return existingEngine;
+  }
+  if (requestedEngine === "docker" || requestedEngine === "podman") {
+    return requestedEngine;
+  }
+  throw new Error("Container engine must be docker or podman.");
 }
 
 export function resolveInstallAccessMode(requestedMode, existingMode = "isolated") {
@@ -308,13 +320,18 @@ export function createDefaultConfig({
   version,
   profile = "light",
   accessMode = "isolated",
-  companionsEnabled = false
+  companionsEnabled = false,
+  engine
 }) {
   assertVersion(version);
   if (!INSTALL_PROFILES.includes(profile)) {
     throw new Error("Default config requires a resolved installation profile.");
   }
   const resolvedAccessMode = resolveInstallAccessMode(accessMode);
+  const resolvedEngine = resolveInstallEngine(engine);
+  if (resolvedEngine === "podman" && resolvedAccessMode === "host-root") {
+    throw new Error("Host-root access (--access host-root) is not supported on Podman. Use --access isolated.");
+  }
   return {
     schemaVersion: CONFIG_SCHEMA_VERSION,
     version,
@@ -326,7 +343,8 @@ export function createDefaultConfig({
     accessMode: resolvedAccessMode,
     companionsEnabled,
     optionalModules: "none",
-    workspaces: []
+    workspaces: [],
+    ...(engine !== undefined ? { engine: resolvedEngine } : {})
   };
 }
 
@@ -363,6 +381,12 @@ export function validateConfig(config) {
   }
   if (config.accessMode !== "isolated" && config.accessMode !== "host-root") {
     throw new Error("accessMode must be isolated or host-root.");
+  }
+  if (config.engine !== undefined && !SUPPORTED_ENGINES.includes(config.engine)) {
+    throw new Error("engine must be docker or podman.");
+  }
+  if (config.engine === "podman" && config.accessMode === "host-root") {
+    throw new Error("Host-root access (--access host-root) is not supported on Podman. Use --access isolated.");
   }
   if (typeof config.companionsEnabled !== "boolean") {
     throw new Error("companionsEnabled must be boolean.");
@@ -673,17 +697,30 @@ const CLI_SANDBOX_OPTIONS = ["    security_opt:", "      - seccomp=./seccomp-cli
 
 export function renderWorkspaceCompose(config, { cliSandbox = false } = {}) {
   validateConfig(config);
+  const isPodman = config.engine === "podman";
   const mounts = config.workspaces.flatMap((workspace) => [
     "      - type: bind",
     `        source: ${JSON.stringify(workspace.hostPath)}`,
     `        target: ${JSON.stringify(workspace.containerPath)}`,
-    `        read_only: ${workspace.readOnly}`
+    `        read_only: ${workspace.readOnly}`,
+    ...(isPodman ? ["        bind:", "          selinux: z"] : [])
   ]);
+  const podmanUserns = isPodman ? ['    userns_mode: "keep-id:uid=10001,gid=10001"'] : [];
   const service = mounts.length > 0
     ? ["    volumes:", ...mounts]
     : ["    volumes: []"];
   if (config.users === undefined) {
-    return ["services:", "  spaceapp-core:", ...service, "  spaceapp-cli:", ...service, ...(cliSandbox ? CLI_SANDBOX_OPTIONS : []), ""].join("\n");
+    return [
+      "services:",
+      "  spaceapp-core:",
+      ...podmanUserns,
+      ...service,
+      "  spaceapp-cli:",
+      ...podmanUserns,
+      ...service,
+      ...(cliSandbox ? CLI_SANDBOX_OPTIONS : []),
+      ""
+    ].join("\n");
   }
   // "user enable": accounts are on, and the core starts a USER's CLIs only in that user's own container.
   const users = config.users;
@@ -905,7 +942,8 @@ export function composeCommand(action, root, options = {}) {
   if (!selected) {
     throw new Error(`Unsupported Compose action "${action}".`);
   }
-  return { command: "docker", args: [...base, ...selected] };
+  const engine = resolveInstallEngine(options.engine);
+  return { command: engine, args: [...base, ...selected] };
 }
 
 export function composeProjectName(root) {
@@ -956,7 +994,8 @@ export async function prepareInstallation(root, {
   version,
   profile,
   accessMode,
-  companionsEnabled
+  companionsEnabled,
+  engine
 }) {
   validateHome(root);
   await mkdir(root, { recursive: true, mode: 0o700 });
@@ -979,8 +1018,20 @@ export async function prepareInstallation(root, {
       version,
       profile: resolvedProfile ?? "light",
       accessMode: resolveInstallAccessMode(accessMode),
-      companionsEnabled
+      companionsEnabled,
+      ...(engine !== undefined ? { engine } : {})
     });
+  } else if (engine !== undefined) {
+    const existingEngine = config.engine ?? "docker";
+    const targetEngine = resolveInstallEngine(engine, existingEngine);
+    if (existingEngine !== targetEngine) {
+      throw new Error(
+        `Cannot switch container engine from ${existingEngine} to ${targetEngine} on an existing installation (${existingEngine} volumes are not visible to ${targetEngine}). Run "${UNIVERSAL_COMMAND} backup", uninstall, and restore on the new engine.`
+      );
+    }
+    if (targetEngine === "podman" && config.engine !== "podman") {
+      config = { ...config, engine: "podman" };
+    }
   }
   if (config.version !== version) {
     config = {
