@@ -729,12 +729,14 @@ export function renderWorkspaceCompose(config, { cliSandbox = false } = {}) {
     "      - type: bind",
     `        source: ${JSON.stringify(workspace.hostPath)}`,
     `        target: ${JSON.stringify(workspace.containerPath)}`,
-    `        read_only: ${workspace.readOnly}`
+    `        read_only: ${workspace.readOnly}`,
+    ...(isPodman ? ["        bind:", "          selinux: z"] : [])
   ];
   const userServices = users.flatMap((user) => {
     const slug = userSlug(user.id);
     return [
       `  spaceapp-cli-${slug}:`,
+      ...podmanUserns,
       // The owner's pinned CLI image (runtime.env sets the digest; 1.1.7 review: a moved tag cannot change a user's).
       "    image: ghcr.io/oll4com/spaceapp-cli:${SPACEAPP_IMAGE_TAG}${SPACEAPP_CLI_IMAGE_DIGEST:-}",
       "    restart: unless-stopped",
@@ -763,6 +765,7 @@ export function renderWorkspaceCompose(config, { cliSandbox = false } = {}) {
   return [
     "services:",
     "  spaceapp-core:",
+    ...podmanUserns,
     "    environment:",
     '      SPACE_MULTI_USER_ENABLED: "true"',
     "      SPACE_CLI_HOST_SOCKETS_FILE: /etc/spaceapp/cli-hosts.json",
@@ -771,6 +774,7 @@ export function renderWorkspaceCompose(config, { cliSandbox = false } = {}) {
     "      - ./cli-hosts.json:/etc/spaceapp/cli-hosts.json:ro",
     ...users.map((user) => `      - spaceapp-cli-socket-${userSlug(user.id)}:/run/spaceapp-cli-users/${userSlug(user.id)}`),
     "  spaceapp-cli:",
+    ...podmanUserns,
     ...service,
     ...(cliSandbox ? CLI_SANDBOX_OPTIONS : []),
     ...userServices,
@@ -1008,8 +1012,10 @@ export async function prepareInstallation(root, {
     ? undefined
     : resolveInstallProfile(profile, profile === "auto" ? await inspectSystemResources(root) : totalmem());
   let config;
+  let existingLoaded = false;
   try {
     config = await loadConfig(root);
+    existingLoaded = true;
   } catch (error) {
     if (error?.code !== "ENOENT") {
       throw error;
@@ -1021,7 +1027,8 @@ export async function prepareInstallation(root, {
       companionsEnabled,
       ...(engine !== undefined ? { engine } : {})
     });
-  } else if (engine !== undefined) {
+  }
+  if (existingLoaded && engine !== undefined) {
     const existingEngine = config.engine ?? "docker";
     const targetEngine = resolveInstallEngine(engine, existingEngine);
     if (existingEngine !== targetEngine) {

@@ -5,9 +5,11 @@ import { join } from "node:path";
 import { Readable, Writable } from "node:stream";
 import test from "node:test";
 import {
+  addUser,
   addWorkspace,
   composeCommand,
   createDefaultConfig,
+  initializeInstallation,
   prepareInstallation,
   renderWorkspaceCompose,
   resolveInstallEngine,
@@ -79,11 +81,25 @@ test("host-root access is refused on Podman with a clear error", () => {
 
 test("switching engines on an existing installation is refused to protect existing volumes", async () => {
   const root = await mkdtemp(join(tmpdir(), "spaceapp-engine-switch-"));
-  await prepareInstallation(root, { version: "1.1.7", profile: "small", engine: "docker" });
+  await initializeInstallation(root, { version: "1.1.7", profile: "small", engine: "docker" });
   await assert.rejects(
     () => prepareInstallation(root, { version: "1.1.7", profile: "small", engine: "podman" }),
     /Cannot switch container engine from docker to podman/i
   );
+});
+
+test("multi-user Podman workspace compose includes keep-id userns_mode and SELinux z on per-user mounts", async () => {
+  const root = await mkdtemp(join(tmpdir(), "spaceapp-podman-multiuser-"));
+  const wsDir = join(root, "user-repo");
+  await mkdir(wsDir, { recursive: true });
+
+  let config = addUser(createDefaultConfig({ version: "1.1.7", profile: "small", engine: "podman" }), "user:alice");
+  config = await addWorkspace(config, wsDir, { userId: "user:alice" });
+
+  const compose = renderWorkspaceCompose(config);
+  const matches = compose.match(/userns_mode: "keep-id:uid=10001,gid=10001"/g) ?? [];
+  assert.equal(matches.length, 3);
+  assert.match(compose, /selinux: z/);
 });
 
 test("inspectStoragePlan probes podman info and podman image inspect when engine is podman", async () => {

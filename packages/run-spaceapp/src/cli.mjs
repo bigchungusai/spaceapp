@@ -822,6 +822,7 @@ async function installCommand(args, {
         root,
         stateRoot: stagedStateRoot,
         profile,
+        engine,
         platform,
         stdin,
         stdout,
@@ -837,6 +838,7 @@ async function installCommand(args, {
         existingConfig,
         attemptedProfile: profile,
         companionsEnabled,
+        engine,
         platform,
         stdin,
         stdout,
@@ -1175,12 +1177,10 @@ async function planInteractiveSetup({
       });
     }
     let resolvedEngineChoice = parsed.requestedEngine;
-    if (resolvedEngineChoice === undefined && platform !== "win32") {
+    if (resolvedEngineChoice === undefined && platform !== "win32" && controllerAnswers.usePodman !== undefined) {
       const dockerReadyNow = await dockerIsReady(execute);
       if (!dockerReadyNow && await podmanIsReady(execute)) {
-        resolvedEngineChoice = stdin?._spaceappPromptController?.nonInteractive
-          ? "podman"
-          : (await promptYesNo(stdin, stdout, "Docker is not available, but Podman is ready. Use Podman instead of installing Docker?", { defaultYes: true, answerKey: "usePodman" }) ? "podman" : "docker");
+        resolvedEngineChoice = controllerAnswers.usePodman ? "podman" : "docker";
       }
     }
     return {
@@ -1337,8 +1337,10 @@ async function repairRuntime({ root, config, platform, stdin, stdout, stderr, ex
     "Repair configuration and recreate the current runtime without deleting data.",
     ...plan.actions.map((action) => action.detail)
   ])) return 1;
-  const prerequisites = await ensureDocker({platform, arch, env, stdin, stdout, stderr, execute, sleep: sleep || wait,
-    installArgs: {root,requestedProfile:repaired.profile,requestedAccessMode:repaired.accessMode,noOpen:true,autoConfirm:true}});
+  const prerequisites = repaired.engine === "podman"
+    ? await ensurePodmanAvailable({ platform, stdout, stderr, execute })
+    : await ensureDocker({platform, arch, env, stdin, stdout, stderr, execute, sleep: sleep || wait,
+        installArgs: {root,requestedProfile:repaired.profile,requestedAccessMode:repaired.accessMode,noOpen:true,autoConfirm:true}});
   if(prerequisites.reexecuted || prerequisites.code !== 0) return prerequisites.code;
   config = repaired;
   if (await verifyStorage({ root, config, existingConfig: config, operation: "repair", inspectResources, execute, stdout, stderr }) !== 0) return 1;
@@ -1643,6 +1645,7 @@ async function reportInstallDiagnostics({
   root,
   stateRoot,
   profile,
+  engine,
   platform,
   stdin,
   stdout,
@@ -1657,7 +1660,8 @@ async function reportInstallDiagnostics({
         composeCommand(action, root, {
           profile,
           stateRoot,
-          lines: 200
+          lines: 200,
+          engine
         }),
         { stdin, stdout, stderr },
         { platform, stderr }
@@ -1681,6 +1685,7 @@ async function restoreRuntimeAfterFailedInstall({
   existingConfig,
   attemptedProfile,
   companionsEnabled,
+  engine,
   platform,
   stdin,
   stdout,
@@ -1699,7 +1704,8 @@ async function restoreRuntimeAfterFailedInstall({
       const restoreCode = await runtimeExecute(
         composeCommand("up", root, {
           profile: existingConfig.profile,
-          companionsEnabled: existingConfig.companionsEnabled
+          companionsEnabled: existingConfig.companionsEnabled,
+          engine: existingConfig.engine
         })
       );
       if (restoreCode === 0) {
@@ -1718,7 +1724,8 @@ async function restoreRuntimeAfterFailedInstall({
       composeCommand("down", root, {
         profile: existingConfig?.profile ?? attemptedProfile,
         stateRoot: existingConfig ? root : stagedStateRoot,
-        companionsEnabled: existingConfig?.companionsEnabled ?? companionsEnabled
+        companionsEnabled: existingConfig?.companionsEnabled ?? companionsEnabled,
+        engine: existingConfig?.engine ?? engine
       })
     );
     if (stopCode !== 0) {
@@ -2396,8 +2403,10 @@ async function updateCommand(args, { root, config, version, platform, stdin, std
       return 0;
     }
   }
-  const prerequisites = await ensureDocker({ platform, arch, env, stdin, stdout, stderr, execute,
-    installArgs: { root, requestedProfile: config.profile, noOpen: true, autoConfirm: true } });
+  const prerequisites = config.engine === "podman"
+    ? await ensurePodmanAvailable({ platform, stdout, stderr, execute })
+    : await ensureDocker({ platform, arch, env, stdin, stdout, stderr, execute,
+        installArgs: { root, requestedProfile: config.profile, noOpen: true, autoConfirm: true } });
   if (prerequisites.reexecuted || prerequisites.code !== 0) return prerequisites.code;
   const resources = await inspectResources(root);
   const storagePlan = await inspectStoragePlan({ root, config: { ...config, version: targetVersion }, existingConfig: config, resources, execute, operation: "upgrade" });
