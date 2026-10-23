@@ -690,13 +690,21 @@ export async function ensurePodmanAvailable({
     stderr.write("Podman engine support is available on Linux and macOS only.\n");
     return { code: 1, reexecuted: false };
   }
-  if (await podmanIsReady(execute)) {
+  const cliOk = await execute({ command: "podman", args: ["--version"] }, { stdout: null, stderr: null }) === 0;
+  const composeOk = cliOk && await execute({ command: "podman", args: ["compose", "version"] }, { stdout: null, stderr: null }) === 0;
+  const infoOk = composeOk && await execute({ command: "podman", args: ["info"] }, { stdout: null, stderr: null }) === 0;
+  if (cliOk && composeOk && infoOk) {
     return { code: 0, reexecuted: false };
   }
+  const failedProbe = !cliOk
+    ? "podman --version"
+    : !composeOk
+      ? "podman compose version (run `podman compose version` to inspect the resolved Compose provider)"
+      : "podman info";
   stderr.write(
     platform === "darwin"
-      ? "Podman and `podman compose` (Podman >= 5 with docker-compose v2 provider) must be installed and your Podman machine must be running (`podman machine init --cpus 4 --memory 8192 --disk-size 25 && podman machine start`).\n"
-      : "Rootless Podman (>= 5) and `podman compose` (with docker-compose v2 provider) must be installed and ready (for example `sudo dnf install -y podman podman-compose docker-compose` on Fedora/RHEL or `sudo apt-get install -y podman podman-compose docker-compose-v2` on Ubuntu/Debian).\n"
+      ? `Podman check failed at \`${failedProbe}\`. Podman (>= 5) and a Compose provider must be installed and your Podman machine must be running (\`podman machine init --cpus 4 --memory 8192 --disk-size 25 && podman machine start\`).\n`
+      : `Podman check failed at \`${failedProbe}\`. Rootless Podman (>= 5, cgroup v2) and \`podman compose\` must be installed and ready (verify with \`podman compose version\`).\n`
   );
   return { code: 1, reexecuted: false };
 }
