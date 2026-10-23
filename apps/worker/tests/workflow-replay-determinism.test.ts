@@ -1,3 +1,5 @@
+import { execFileSync } from "node:child_process";
+import { existsSync } from "node:fs";
 import { readdir, readFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -93,6 +95,13 @@ describe("Temporal real V8 sandbox workflow replay determinism gate (#60)", () =
   const bundles = new Map<string, { code: string }>();
 
   beforeAll(async () => {
+    if (!existsSync(join(WORKER_ROOT, "dist", "workflows.js"))) {
+      try {
+        execFileSync("npx", ["tsc", "-p", join(WORKER_ROOT, "tsconfig.json")], { stdio: "ignore" });
+      } catch {
+        // tsc emits the workflow JS files into dist/ even when non-workflow activity type declarations are unbuilt
+      }
+    }
     for (const name of ["workflows", "memory-maintenance-workflows", "memory-mutation-workflows"]) {
       const workflowsPath = join(WORKER_ROOT, "dist", `${name}.js`);
       const bundle = await bundleWorkflowCode({ workflowsPath });
