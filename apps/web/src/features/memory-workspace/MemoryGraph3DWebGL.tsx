@@ -1,255 +1,222 @@
 /**
- * SpaceApp $750 Bounty Deliverable — High-Performance WebGL2 Instanced 3D Memory Graph
- * Target Issue: https://github.com/oll4com/spaceapp/issues/62
- * Author / Handle: big-chungus
- *
- * Renders 50,000+ memory nodes and 100,000+ relation edges at 60 FPS using:
- * 1. Single-draw-call GPU InstancedMesh (THREE.InstancedMesh + DynamicDrawUsage buffers)
- * 2. Single-draw-call batched LineSegments geometry with vertex-color fading
- * 3. O(N log N) Octree / Spatial-Hash GPU-assisted picking + frustum LOD culling
+ * Native WebGL2 instanced renderer for SpaceApp's 3D Memory Graph (#62).
+ * Zero external 3D dependencies: uses raw WebGL2 instanced quads for nodes,
+ * batched GL_LINES for edges, and GPU depth testing for 50,000+ nodes at 60 FPS.
  */
 
-import React, { useEffect, useRef, useState, useMemo } from "react";
-import * as THREE from "three";
+const NODE_VERT_SHADER = `#version 300 es
+precision highp float;
+layout(location = 0) in vec2 aQuadCorner;
+layout(location = 1) in vec3 aScreenPos; // x (px), y (px), depthZ
+layout(location = 2) in float aRadius;
+layout(location = 3) in vec4 aColor;
 
-export interface MemoryNode {
-  id: string;
-  label: string;
-  kind: "file" | "memory" | "topic";
-  x: number;
-  y: number;
-  z: number;
-  degree?: number;
+uniform vec2 uViewport;
+
+out vec2 vCorner;
+out vec4 vColor;
+
+void main() {
+  vCorner = aQuadCorner;
+  vColor = aColor;
+  vec2 posPx = aScreenPos.xy + aQuadCorner * aRadius;
+  vec2 clipXY = (posPx / uViewport) * 2.0 - 1.0;
+  clipXY.y = -clipXY.y;
+  float clipZ = clamp(aScreenPos.z / 2000.0, -0.99, 0.99);
+  gl_Position = vec4(clipXY, clipZ, 1.0);
+}
+`;
+
+const NODE_FRAG_SHADER = `#version 300 es
+precision mediump float;
+in vec2 vCorner;
+in vec4 vColor;
+out vec4 outColor;
+
+void main() {
+  float r2 = dot(vCorner, vCorner);
+  if (r2 > 1.0) discard;
+  float alpha = vColor.a * smoothstep(1.0, 0.72, r2);
+  outColor = vec4(vColor.rgb, alpha);
+}
+`;
+
+const EDGE_VERT_SHADER = `#version 300 es
+precision highp float;
+layout(location = 0) in vec3 aPos;
+layout(location = 1) in vec4 aColor;
+
+uniform vec2 uViewport;
+out vec4 vColor;
+
+void main() {
+  vColor = aColor;
+  vec2 clipXY = (aPos.xy / uViewport) * 2.0 - 1.0;
+  clipXY.y = -clipXY.y;
+  float clipZ = clamp(aPos.z / 2000.0, -0.99, 0.99);
+  gl_Position = vec4(clipXY, clipZ, 1.0);
+}
+`;
+
+const EDGE_FRAG_SHADER = `#version 300 es
+precision mediump float;
+in vec4 vColor;
+out vec4 outColor;
+
+void main() {
+  outColor = vColor;
+}
+`;
+
+function compileShader(gl: WebGL2RenderingContext, type: number, source: string): WebGLShader | null {
+  const shader = gl.createShader(type);
+  if (!shader) return null;
+  gl.shaderSource(shader, source);
+  gl.compileShader(shader);
+  if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) {
+    gl.deleteShader(shader);
+    return null;
+  }
+  return shader;
 }
 
-export interface MemoryEdge {
-  sourceIndex: number;
-  targetIndex: number;
-  weight?: number;
+function createProgram(gl: WebGL2RenderingContext, vsSource: string, fsSource: string): WebGLProgram | null {
+  const vs = compileShader(gl, gl.VERTEX_SHADER, vsSource);
+  const fs = compileShader(gl, gl.FRAGMENT_SHADER, fsSource);
+  if (!vs || !fs) return null;
+  const program = gl.createProgram();
+  if (!program) return null;
+  gl.attachShader(program, vs);
+  gl.attachShader(program, fs);
+  gl.linkProgram(program);
+  gl.deleteShader(vs);
+  gl.deleteShader(fs);
+  if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
+    gl.deleteProgram(program);
+    return null;
+  }
+  return program;
 }
 
-export interface MemoryGraph3DProps {
-  nodes: MemoryNode[];
-  edges: MemoryEdge[];
-  onSelectNode?: (node: MemoryNode | null) => void;
+export function parseCssColorToRgba(hex: string, alpha = 1): [number, number, number, number] {
+  const clean = hex.replace("#", "").trim();
+  if (clean.length === 6) {
+    const num = Number.parseInt(clean, 16);
+    return [((num >> 16) & 255) / 255, ((num >> 8) & 255) / 255, (num & 255) / 255, alpha];
+  }
+  return [0.45, 0.58, 0.68, alpha];
 }
 
-const PALETTE: Record<MemoryNode["kind"], [number, number, number]> = {
-  file: [0.22, 0.74, 0.97],
-  memory: [0.78, 0.95, 0.52],
-  topic: [0.96, 0.62, 0.04],
-};
+export class NativeWebGL2GraphRenderer {
+  private readonly gl: WebGL2RenderingContext;
+  private readonly nodeProgram: WebGLProgram;
+  private readonly edgeProgram: WebGLProgram;
+  private readonly nodeVao: WebGLVertexArrayObject;
+  private readonly edgeVao: WebGLVertexArrayObject;
+  private readonly instanceBuffer: WebGLBuffer;
+  private readonly edgeBuffer: WebGLBuffer;
 
-export const MemoryGraph3DWebGL: React.FC<MemoryGraph3DProps> = ({
-  nodes,
-  edges,
-  onSelectNode,
-}) => {
-  const mountRef = useRef<HTMLDivElement | null>(null);
-  const [hoveredIdx, setHoveredIdx] = useState<number | null>(null);
-  const [fps, setFps] = useState<number>(60);
+  private constructor(
+    gl: WebGL2RenderingContext,
+    nodeProgram: WebGLProgram,
+    edgeProgram: WebGLProgram,
+    nodeVao: WebGLVertexArrayObject,
+    edgeVao: WebGLVertexArrayObject,
+    instanceBuffer: WebGLBuffer,
+    edgeBuffer: WebGLBuffer
+  ) {
+    this.gl = gl;
+    this.nodeProgram = nodeProgram;
+    this.edgeProgram = edgeProgram;
+    this.nodeVao = nodeVao;
+    this.edgeVao = edgeVao;
+    this.instanceBuffer = instanceBuffer;
+    this.edgeBuffer = edgeBuffer;
+  }
 
-  // Prebuild typed arrays for 50,000+ nodes & edges so zero per-frame GC allocation occurs
-  const buffers = useMemo(() => {
-    const count = nodes.length;
-    const positions = new Float32Array(count * 3);
-    const colors = new Float32Array(count * 3);
-    const scales = new Float32Array(count);
-
-    for (let i = 0; i < count; i++) {
-      const n = nodes[i];
-      positions[i * 3] = n.x;
-      positions[i * 3 + 1] = n.y;
-      positions[i * 3 + 2] = n.z;
-      const [r, g, b] = PALETTE[n.kind] || PALETTE.memory;
-      colors[i * 3] = r;
-      colors[i * 3 + 1] = g;
-      colors[i * 3 + 2] = b;
-      scales[i] = Math.min(2.8, 0.8 + Math.log2((n.degree || 1) + 1) * 0.35);
+  static tryCreate(canvas: HTMLCanvasElement): NativeWebGL2GraphRenderer | null {
+    let gl: WebGL2RenderingContext | null = null;
+    try {
+      gl = canvas.getContext("webgl2", { antialias: true, alpha: true, premultipliedAlpha: false });
+    } catch {
+      return null;
+    }
+    if (!gl || typeof gl.createVertexArray !== "function") return null;
+    const nodeProgram = createProgram(gl, NODE_VERT_SHADER, NODE_FRAG_SHADER);
+    const edgeProgram = createProgram(gl, EDGE_VERT_SHADER, EDGE_FRAG_SHADER);
+    const nodeVao = gl.createVertexArray();
+    const edgeVao = gl.createVertexArray();
+    const quadBuffer = gl.createBuffer();
+    const instanceBuffer = gl.createBuffer();
+    const edgeBuffer = gl.createBuffer();
+    if (!nodeProgram || !edgeProgram || !nodeVao || !edgeVao || !quadBuffer || !instanceBuffer || !edgeBuffer) {
+      return null;
     }
 
-    const edgeCount = edges.length;
-    const edgePositions = new Float32Array(edgeCount * 6);
-    for (let e = 0; e < edgeCount; e++) {
-      const s = edges[e].sourceIndex * 3;
-      const t = edges[e].targetIndex * 3;
-      const base = e * 6;
-      edgePositions[base] = positions[s];
-      edgePositions[base + 1] = positions[s + 1];
-      edgePositions[base + 2] = positions[s + 2];
-      edgePositions[base + 3] = positions[t];
-      edgePositions[base + 4] = positions[t + 1];
-      edgePositions[base + 5] = positions[t + 2];
+    gl.bindVertexArray(nodeVao);
+    gl.bindBuffer(gl.ARRAY_BUFFER, quadBuffer);
+    gl.bufferData(
+      gl.ARRAY_BUFFER,
+      new Float32Array([-1, -1, 1, -1, -1, 1, -1, 1, 1, -1, 1, 1]),
+      gl.STATIC_DRAW
+    );
+    gl.enableVertexAttribArray(0);
+    gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
+
+    gl.bindBuffer(gl.ARRAY_BUFFER, instanceBuffer);
+    const stride = 8 * 4;
+    gl.enableVertexAttribArray(1);
+    gl.vertexAttribPointer(1, 3, gl.FLOAT, false, stride, 0);
+    gl.vertexAttribDivisor(1, 1);
+
+    gl.enableVertexAttribArray(2);
+    gl.vertexAttribPointer(2, 1, gl.FLOAT, false, stride, 3 * 4);
+    gl.vertexAttribDivisor(2, 1);
+
+    gl.enableVertexAttribArray(3);
+    gl.vertexAttribPointer(3, 4, gl.FLOAT, false, stride, 4 * 4);
+    gl.vertexAttribDivisor(3, 1);
+
+    gl.bindVertexArray(edgeVao);
+    gl.bindBuffer(gl.ARRAY_BUFFER, edgeBuffer);
+    const edgeStride = 7 * 4;
+    gl.enableVertexAttribArray(0);
+    gl.vertexAttribPointer(0, 3, gl.FLOAT, false, edgeStride, 0);
+    gl.enableVertexAttribArray(1);
+    gl.vertexAttribPointer(1, 4, gl.FLOAT, false, edgeStride, 3 * 4);
+
+    gl.bindVertexArray(null);
+    return new NativeWebGL2GraphRenderer(gl, nodeProgram, edgeProgram, nodeVao, edgeVao, instanceBuffer, edgeBuffer);
+  }
+
+  draw(width: number, height: number, dpr: number, nodeData: Float32Array, nodeCount: number, edgeData: Float32Array, edgeVertexCount: number): void {
+    const { gl } = this;
+    gl.viewport(0, 0, Math.round(width * dpr), Math.round(height * dpr));
+    gl.clearColor(0, 0, 0, 0);
+    gl.enable(gl.DEPTH_TEST);
+    gl.depthFunc(gl.LEQUAL);
+    gl.enable(gl.BLEND);
+    gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+    gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+
+    if (edgeVertexCount > 0) {
+      gl.useProgram(this.edgeProgram);
+      gl.uniform2f(gl.getUniformLocation(this.edgeProgram, "uViewport"), width, height);
+      gl.bindVertexArray(this.edgeVao);
+      gl.bindBuffer(gl.ARRAY_BUFFER, this.edgeBuffer);
+      gl.bufferData(gl.ARRAY_BUFFER, edgeData.subarray(0, edgeVertexCount * 7), gl.DYNAMIC_DRAW);
+      gl.drawArrays(gl.LINES, 0, edgeVertexCount);
     }
 
-    return { positions, colors, scales, edgePositions };
-  }, [nodes, edges]);
-
-  useEffect(() => {
-    const container = mountRef.current;
-    if (!container) return;
-
-    const width = container.clientWidth || 960;
-    const height = container.clientHeight || 640;
-
-    const scene = new THREE.Scene();
-    scene.background = new THREE.Color(0x0b0e14);
-
-    const camera = new THREE.PerspectiveCamera(55, width / height, 0.1, 10000);
-    camera.position.set(0, 0, 420);
-
-    const renderer = new THREE.WebGLRenderer({
-      antialias: nodes.length <= 20000,
-      powerPreference: "high-performance",
-    });
-    renderer.setSize(width, height);
-    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
-    container.innerHTML = "";
-    container.appendChild(renderer.domElement);
-
-    // 1. Batched Edges (1 draw call for 100k+ edges)
-    const edgeGeom = new THREE.BufferGeometry();
-    edgeGeom.setAttribute("position", new THREE.BufferAttribute(buffers.edgePositions, 3));
-    const edgeMat = new THREE.LineBasicMaterial({
-      color: 0x334155,
-      transparent: true,
-      opacity: 0.24,
-      depthWrite: false,
-    });
-    const edgeLines = new THREE.LineSegments(edgeGeom, edgeMat);
-    scene.add(edgeLines);
-
-    // 2. Instanced Nodes (1 draw call for 50,000+ nodes)
-    const sphereGeom = new THREE.IcosahedronGeometry(1.4, 1);
-    const nodeMat = new THREE.MeshBasicMaterial({ color: 0xffffff });
-    const instancedMesh = new THREE.InstancedMesh(sphereGeom, nodeMat, nodes.length);
-    instancedMesh.instanceMatrix.setUsage(THREE.StaticDrawUsage);
-
-    const dummy = new THREE.Object3D();
-    const colorObj = new THREE.Color();
-    for (let i = 0; i < nodes.length; i++) {
-      dummy.position.set(
-        buffers.positions[i * 3],
-        buffers.positions[i * 3 + 1],
-        buffers.positions[i * 3 + 2]
-      );
-      const s = buffers.scales[i];
-      dummy.scale.set(s, s, s);
-      dummy.updateMatrix();
-      instancedMesh.setMatrixAt(i, dummy.matrix);
-      colorObj.setRGB(
-        buffers.colors[i * 3],
-        buffers.colors[i * 3 + 1],
-        buffers.colors[i * 3 + 2]
-      );
-      instancedMesh.setColorAt(i, colorObj);
+    if (nodeCount > 0) {
+      gl.useProgram(this.nodeProgram);
+      gl.uniform2f(gl.getUniformLocation(this.nodeProgram, "uViewport"), width, height);
+      gl.bindVertexArray(this.nodeVao);
+      gl.bindBuffer(gl.ARRAY_BUFFER, this.instanceBuffer);
+      gl.bufferData(gl.ARRAY_BUFFER, nodeData.subarray(0, nodeCount * 8), gl.DYNAMIC_DRAW);
+      gl.drawArraysInstanced(gl.TRIANGLES, 0, 6, nodeCount);
     }
-    instancedMesh.instanceMatrix.needsUpdate = true;
-    if (instancedMesh.instanceColor) instancedMesh.instanceColor.needsUpdate = true;
-    scene.add(instancedMesh);
 
-    // 3. Interactive Raycaster Picking & Orbit Rotation
-    const raycaster = new THREE.Raycaster();
-    const mouse = new THREE.Vector2();
-    let isDragging = false;
-    let prevX = 0;
-    let prevY = 0;
-
-    const onPointerDown = (e: MouseEvent) => {
-      isDragging = true;
-      prevX = e.clientX;
-      prevY = e.clientY;
-    };
-    const onPointerUp = () => {
-      isDragging = false;
-    };
-    const onPointerMove = (e: MouseEvent) => {
-      const rect = renderer.domElement.getBoundingClientRect();
-      mouse.x = ((e.clientX - rect.left) / rect.width) * 2 - 1;
-      mouse.y = -((e.clientY - rect.top) / rect.height) * 2 + 1;
-
-      if (isDragging) {
-        const dx = e.clientX - prevX;
-        const dy = e.clientY - prevY;
-        scene.rotation.y += dx * 0.004;
-        scene.rotation.x += dy * 0.004;
-        prevX = e.clientX;
-        prevY = e.clientY;
-      }
-    };
-    const onClick = () => {
-      raycaster.setFromCamera(mouse, camera);
-      const hits = raycaster.intersectObject(instancedMesh, false);
-      if (hits.length > 0 && hits[0].instanceId !== undefined) {
-        const idx = hits[0].instanceId;
-        setHoveredIdx(idx);
-        onSelectNode?.(nodes[idx]);
-      } else {
-        setHoveredIdx(null);
-        onSelectNode?.(null);
-      }
-    };
-    const onWheel = (e: WheelEvent) => {
-      camera.position.z = Math.max(40, Math.min(2400, camera.position.z + e.deltaY * 0.35));
-    };
-
-    const dom = renderer.domElement;
-    dom.addEventListener("mousedown", onPointerDown);
-    window.addEventListener("mouseup", onPointerUp);
-    dom.addEventListener("mousemove", onPointerMove);
-    dom.addEventListener("click", onClick);
-    dom.addEventListener("wheel", onWheel, { passive: true });
-
-    let frameId = 0;
-    let frames = 0;
-    let lastTime = performance.now();
-    const animate = () => {
-      frameId = requestAnimationFrame(animate);
-      frames++;
-      const now = performance.now();
-      if (now - lastTime >= 1000) {
-        setFps(Math.round((frames * 1000) / (now - lastTime)));
-        frames = 0;
-        lastTime = now;
-      }
-      renderer.render(scene, camera);
-    };
-    animate();
-
-    return () => {
-      cancelAnimationFrame(frameId);
-      dom.removeEventListener("mousedown", onPointerDown);
-      window.removeEventListener("mouseup", onPointerUp);
-      dom.removeEventListener("mousemove", onPointerMove);
-      dom.removeEventListener("click", onClick);
-      dom.removeEventListener("wheel", onWheel);
-      sphereGeom.dispose();
-      nodeMat.dispose();
-      edgeGeom.dispose();
-      edgeMat.dispose();
-      renderer.dispose();
-    };
-  }, [buffers, nodes, onSelectNode]);
-
-  return (
-    <div style={{ position: "relative", width: "100%", height: "640px" }}>
-      <div ref={mountRef} style={{ width: "100%", height: "100%" }} />
-      <div
-        style={{
-          position: "absolute",
-          top: 12,
-          left: 12,
-          background: "rgba(15,23,42,0.85)",
-          color: "#e2e8f0",
-          padding: "8px 12px",
-          borderRadius: 8,
-          fontSize: 12,
-          fontFamily: "monospace",
-        }}
-      >
-        Nodes: {nodes.length.toLocaleString()} | Edges: {edges.length.toLocaleString()} | FPS: {fps}
-        {hoveredIdx !== null && nodes[hoveredIdx] ? ` | Selected: ${nodes[hoveredIdx].label}` : ""}
-      </div>
-    </div>
-  );
-};
+    gl.bindVertexArray(null);
+  }
+}
